@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Solari Board</title>
+  <style>
+    :root {
+      --cell-radius: 10px;
+      --panel:        #0e0e0e;
+      --cell-bg:      #161616;
+      --cell-border:  #1f1f1f;
+      --cell-divider: #101010;
+      --glyph:        #e5e5e5;
+      --glow:         #2a2a2a;
+      --amber:        #e8a020;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 28px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                   "Liberation Mono", "Courier New", monospace;
+      color: var(--glyph);
+    }
+
+    .board-wrap {
+      background: var(--panel);
+      border-radius: 20px;
+      padding: 22px 28px 18px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.7), inset 0 0 0 1px #1a1a1a;
+    }
+
+    .board-label {
+      font-size: 10px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: #3a3a3a;
+      margin-bottom: 12px;
+      text-align: center;
+    }
+
+    /* Rows stack vertically */
+    .board {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .board-row {
+      display: flex;
+    }
+
+    /* Cell size set via inline style from JS */
+    .cell {
+      position: relative;
+      background: var(--cell-bg);
+      border-radius: var(--cell-radius);
+      border: 1px solid var(--cell-border);
+      box-shadow:
+        inset 0 8px 20px rgba(0,0,0,0.55),
+        inset 0 -6px 14px rgba(0,0,0,0.45),
+        inset 0 0 0 1px var(--glow);
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    /* Centre hinge line */
+    .cell::before {
+      content: "";
+      position: absolute;
+      left: 0; right: 0; top: 50%;
+      height: 1px;
+      background: linear-gradient(to right, transparent, var(--cell-divider), transparent);
+      transform: translateY(-0.5px);
+      pointer-events: none;
+    }
+
+    .glyph {
+      letter-spacing: 1px;
+      line-height: 1;
+      transform-style: preserve-3d;
+      display: inline-block;
+      will-change: transform;
+    }
+
+    .flip {
+      animation: flip 340ms cubic-bezier(.45,.03,.27,.99) both;
+    }
+
+    @keyframes flip {
+      0%   { transform: rotateX(0deg);   filter: brightness(1); }
+      49%  { transform: rotateX(90deg);  filter: brightness(0.6); }
+      50%  { transform: rotateX(270deg); filter: brightness(0.6); }
+      100% { transform: rotateX(360deg); filter: brightness(1); }
+    }
+
+    .statusbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      color: #333;
+    }
+
+    .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #2a2a2a;
+      transition: background 0.4s;
+    }
+    .dot.live   { background: #2d7a2d; box-shadow: 0 0 6px #2d7a2d; }
+    .dot.update { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+
+    .post-link {
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #2a2a2a;
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    .post-link:hover { color: var(--amber); }
+  </style>
+</head>
+<body>
+
+  <div class="board-wrap" id="board-wrap">
+    <p class="board-label">Departures</p>
+    <div class="board" id="board" aria-live="polite" aria-label="Solari display board"></div>
+  </div>
+
+  <div class="statusbar">
+    <span class="dot" id="dot"></span>
+    <span id="status">Connecting…</span>
+    <span>·</span>
+    <a class="post-link" href="/send">Post a message</a>
+  </div>
+
+  <script>
+    // ── Characters the flaps can show ───────────────────────────────
+    // Must match the DISPLAY_CHARS set in app.py exactly.
+    const SEQ = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?-:/()@#";
+
+    // ── Cell size steps, largest first ──────────────────────────────
+    const SIZE_STEPS = [
+      { cellW: 52, cellH: 72, glyphPx: 42, gap: 6 },
+      { cellW: 44, cellH: 62, glyphPx: 36, gap: 5 },
+      { cellW: 36, cellH: 50, glyphPx: 28, gap: 4 },
+      { cellW: 28, cellH: 40, glyphPx: 22, gap: 3 },
+    ];
+
+    // Horizontal padding inside .board-wrap (28px left + 28px right)
+    const BOARD_H_PAD = 56;
+    // Body side margins (~16px each side)
+    const BODY_MARGIN = 32;
+
+    // ── State ────────────────────────────────────────────────────────
+    let currentMessage = "";
+    let cells = [];           // flat array, one entry per character cell
+    let busy  = false;
+
+    const boardEl  = document.getElementById("board");
+    const dot      = document.getElementById("dot");
+    const statusEl = document.getElementById("status");
+
+    // ── Status indicator ─────────────────────────────────────────────
+    function setStatus(text, state) {
+      statusEl.textContent = text;
+      dot.className = "dot" + (state ? " " + state : "");
+    }
+
+    // ── Layout engine ────────────────────────────────────────────────
+
+    // Word-wrap msg into rows of at most `cols` characters,
+    // then pad every row to the same width with trailing spaces.
+    function wordWrap(msg, cols) {
+      const words = msg.split(" ");
+      const rows  = [];
+      let   line  = "";
+
+      for (const word of words) {
+        const candidate = line.length === 0 ? word : line + " " + word;
+        if (candidate.length <= cols) {
+          line = candidate;
+        } else {
+          if (line.length) rows.push(line);
+          line = word;
+        }
+      }
+      if (line.length) rows.push(line);
+
+      // Pad all rows to the width of the longest row
+      const maxLen = rows.reduce((a, r) => Math.max(a, r.length), 0);
+      return rows.map(r => r.padEnd(maxLen, " "));
+    }
+
+    // Choose the largest cell size where every word fits on one line,
+    // then return the wrapped+padded rows for that size.
+    function layoutMessage(msg) {
+      const availW      = window.innerWidth - BODY_MARGIN - BOARD_H_PAD;
+      const longestWord = msg.split(" ").reduce((a, w) => Math.max(a, w.length), 0);
+
+      for (const size of SIZE_STEPS) {
+        const cols = Math.floor((availW + size.gap) / (size.cellW + size.gap));
+        if (cols >= longestWord) {
+          return { rows: wordWrap(msg, cols), size };
+        }
+      }
+
+      // Fallback: smallest size; hard-split any word that still won't fit
+      const size  = SIZE_STEPS[SIZE_STEPS.length - 1];
+      const cols  = Math.max(1, Math.floor((availW + size.gap) / (size.cellW + size.gap)));
+      const safe  = [];
+      for (const word of msg.split(" ")) {
+        if (word.length > cols) {
+          for (let i = 0; i < word.length; i += cols) safe.push(word.slice(i, i + cols));
+        } else {
+          safe.push(word);
+        }
+      }
+      return { rows: wordWrap(safe.join(" "), cols), size };
+    }
+
+    // ── DOM helpers ──────────────────────────────────────────────────
+
+    function makeCell(size) {
+      const cell  = document.createElement("div");
+      cell.className    = "cell";
+      cell.style.width  = size.cellW + "px";
+      cell.style.height = size.cellH + "px";
+
+      const glyph = document.createElement("span");
+      glyph.className       = "glyph";
+      glyph.style.fontSize  = size.glyphPx + "px";
+      glyph.textContent     = " ";
+      cell.appendChild(glyph);
+      return cell;
+    }
+
+    // Tear down the board and rebuild it blank for the new layout.
+    // Populates the global cells[] array — one entry per character.
+    function rebuildBoard(rows, size) {
+      boardEl.innerHTML = "";
+      cells = [];
+
+      // Gap between rows applied as margin-bottom on each row except the last
+      for (let r = 0; r < rows.length; r++) {
+        const rowEl = document.createElement("div");
+        rowEl.className = "board-row";
+        if (r < rows.length - 1) rowEl.style.marginBottom = size.gap + "px";
+        // Gap between cells in a row applied as margin-right on each cell except last
+        for (let c = 0; c < rows[r].length; c++) {
+          const cell = makeCell(size);
+          if (c < rows[r].length - 1) cell.style.marginRight = size.gap + "px";
+          rowEl.appendChild(cell);
+          cells.push(cell);
+        }
+        boardEl.appendChild(rowEl);
+      }
+    }
+
+    // ── Flip animation ───────────────────────────────────────────────
+
+    function flipTo(cell, targetChar, speed) {
+      const glyph = cell.firstElementChild;
+      let   cur   = glyph.textContent;
+
+      if (cur === targetChar) {
+        // Already correct — do a single cosmetic flip
+        glyph.classList.add("flip");
+        return new Promise(r =>
+          glyph.addEventListener("animationend", () => {
+            glyph.classList.remove("flip"); r();
+          }, { once: true })
+        );
+      }
+
+      return new Promise(resolve => {
+        const timer = setInterval(() => {
+          const next = SEQ[(SEQ.indexOf(cur) + 1) % SEQ.length];
+          glyph.textContent = next;
+          glyph.classList.remove("flip");
+          void glyph.offsetWidth;         // force reflow → restart animation
+          glyph.classList.add("flip");
+          cur = next;
+          if (cur === targetChar) {
+            clearInterval(timer);
+            glyph.addEventListener("animationend", () => {
+              glyph.classList.remove("flip"); resolve();
+            }, { once: true });
+          }
+        }, speed);
+      });
+    }
+
+    // ── Show a new message ───────────────────────────────────────────
+
+    async function showMessage(msg) {
+      if (busy) return;
+      busy = true;
+
+      const target          = msg.toUpperCase();
+      const { rows, size }  = layoutMessage(target);
+
+      // Rebuild DOM — cells[] is repopulated here
+      rebuildBoard(rows, size);
+
+      // Flatten rows to get exactly the characters each cell must show.
+      // This is the single source of truth — same logic that built the cells.
+      const allChars = rows.flatMap(row => [...row]);
+
+      // Double-check alignment (helpful during development)
+      if (allChars.length !== cells.length) {
+        console.error(`Mismatch: ${cells.length} cells vs ${allChars.length} chars`);
+      }
+
+      // Kick off all flips with a small cascading stagger
+      const flips = allChars.map((ch, i) =>
+        new Promise(r => setTimeout(
+          () => flipTo(cells[i], ch, 26 + Math.random() * 18).then(r),
+          i * 50 + Math.random() * 50
+        ))
+      );
+
+      await Promise.all(flips);
+      currentMessage = target;
+      busy = false;
+    }
+
+    // ── Polling ──────────────────────────────────────────────────────
+
+    const POLL_MS = 4000;
+
+    async function poll() {
+      try {
+        const res  = await fetch("/api/message", { cache: "no-store" });
+        const data = await res.json();
+        const msg  = (data.message || "").toUpperCase();
+        setStatus("Live", "live");
+        if (msg !== currentMessage) {
+          setStatus("Updating…", "update");
+          await showMessage(msg);
+          setStatus("Live", "live");
+        }
+      } catch {
+        setStatus("Offline – retrying…", "");
+      }
+    }
+
+    // Re-layout when the window is resized
+    let resizeTimer;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (currentMessage && !busy) showMessage(currentMessage);
+      }, 300);
+    });
+
+    // ── Boot ─────────────────────────────────────────────────────────
+    (async () => {
+      await poll();
+      setInterval(poll, POLL_MS);
+    })();
+  </script>
+</body>
+</html>
